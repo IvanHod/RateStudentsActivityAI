@@ -26,7 +26,7 @@ def split_audio_to_chunks(path_audio: Path, chunk_ms: int = 60_000, output_dir: 
 def transcribe_chunks(
     chunk_paths: Iterable[Path],
     output_dir: Path | None = None,
-    model_name: str = "small",
+    model_name: str = "medium",
     language: str = "ru",
     task: str = "transcribe",
 ) -> tuple[list[str], str]:
@@ -48,7 +48,7 @@ def transcribe_chunks(
         output_dir = Path(__file__).parent / "data" / "transcripts"
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    model = whisper.load_model(model_name)  # , device='mps'
+    model = whisper.load_model(model_name, device='cuda')
 
     transcript_paths: list[str] = []
     full_text_parts: list[str] = []

@@ -3,13 +3,22 @@ name = "studentscoreai"
 version = "0.1.0"
 description = "Add your description here"
 readme = "README.md"
-requires-python = ">=3.10"
+requires-python = ">=3.12, <3.13"
 dependencies = [
-    "google-api-python-client>=2.194.0",
-    "langchain>=1.2.15",
-    "langchain-classic>=1.0.3",
-    "langchain-openai>=1.1.12",
-    "openai-whisper>=20250625",
+    "google-api-python-client>=2.140.0",
+    "langchain>=0.3.0",
+    "langchain-classic>=1.0.0",
+    "langchain-openai>=0.2.0",
+    "noisereduce>=3.0.3",
+    "openai-whisper",
     "pydub>=0.25.1",
-    "python-dotenv>=1.2.2",
+    "python-dotenv>=1.0.0",
+    "torch>=2.0.0",
 ]
+
+[tool.uv.sources]
+torch = { index = "pytorch" }
+
+[[tool.uv.index]]
+name = "pytorch"
+url = "https://download.pytorch.org/whl/cu124"

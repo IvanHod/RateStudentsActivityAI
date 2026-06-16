@@ -1,4 +1,3 @@
-import json
 from pathlib import Path
 
 from langgraph.graph import StateGraph, END
@@ -10,84 +9,11 @@ from student_score_ai.validate_names import validate_student_names_with_gpt, Val
 
 # from student_score_ai.sheets import update_scores
 
-CACHE_DIR = Path(__file__).parent / "data" / "cache"
-CACHE_DIR.mkdir(parents=True, exist_ok=True)
-
-
-def _cache_path(state: PipelineState, node_name: str) -> Path:
-    video_name = Path(state["video_path"]).name
-    return CACHE_DIR / f"{video_name}.{node_name}.json"
-
-
-def _serialize_cache_payload(state: PipelineState, keys: list[str]) -> dict:
-    payload: dict = {}
-
-    for key in keys:
-        if key not in state:
-            continue
-
-        value = state[key]
-        if isinstance(value, Path):
-            payload[key] = str(value)
-        elif isinstance(value, list):
-            payload[key] = [str(item) if isinstance(item, Path) else item for item in value]
-        else:
-            payload[key] = value
-
-    return payload
-
-
-def _load_cache_payload(path: Path) -> dict:
-    with open(path, "r", encoding="utf-8") as cache_file:
-        return json.load(cache_file)
-
-
-def _restore_cached_values(state: PipelineState, payload: dict) -> PipelineState:
-    if "audio_path" in payload:
-        state["audio_path"] = Path(payload["audio_path"])
-    if "chunk_paths" in payload:
-        state["chunk_paths"] = [Path(item) for item in payload["chunk_paths"]]
-    if "transcript_paths" in payload:
-        state["transcript_paths"] = payload["transcript_paths"]
-    if "full_transcript" in payload:
-        state["full_transcript"] = payload["full_transcript"]
-    if "extracted_names" in payload:
-        state["extracted_names"] = payload["extracted_names"]
-    if "validated_students" in payload:
-        state["validated_students"] = payload["validated_students"]
-    if "sheet_updates" in payload:
-        state["sheet_updates"] = payload["sheet_updates"]
-    return state
-
-
-def _cached_node(
-    state: PipelineState,
-    node_name: str,
-    runner,
-    cache_keys: list[str],
-) -> PipelineState:
-    cache_file = _cache_path(state, node_name)
-    state.setdefault("logs", [])
-
-    if cache_file.exists():
-        payload = _load_cache_payload(cache_file)
-        _restore_cached_values(state, payload)
-        state["logs"].append(f"{node_name}: loaded from cache {cache_file.name}")
-        return state
-
-    state = runner(state)
-    payload = _serialize_cache_payload(state, cache_keys)
-    with open(cache_file, "w", encoding="utf-8") as f:
-        json.dump(payload, f, ensure_ascii=False, indent=2)
-
-    state["logs"].append(f"{node_name}: cached to {cache_file.name}")
-    return state
-
 
 def node_video_to_audio(state: PipelineState) -> PipelineState:
     path_input: Path = state["video_path"]
 
-    state["audio_path"] = path_output = path_input.parent / 'cache' / f"{path_input.stem}.wav"
+    state["audio_path"] = path_output = path_input.parent / f'cache_{path_input.stem}' / f"{path_input.stem}.wav"
     if not path_output.exists():
         video_to_audio(path_input, path_output)
         state.setdefault("logs", []).append(f"Audio saved: {path_output}")
@@ -113,7 +39,11 @@ def node_transcribe(state: PipelineState) -> PipelineState:
     state["full_transcript"] = ''  # str
     for path in sorted(output_dir.glob('*.txt'), key=lambda p: int(p.stem[-4:])):
         with open(path, "r", encoding="utf-8") as file:
-            state["full_transcript"] += file.read()
+            state["full_transcript"] += file.read() + '\n'
+
+    with open(path_input.parent / 'transcripts.txt', "w", encoding="utf-8") as file:
+        file.write(state["full_transcript"])
+
 
     state["logs"].append(f"Transcribed chunks: {output_dir}")
 
@@ -125,7 +55,7 @@ def node_extract_names(state: PipelineState) -> PipelineState:
     if not path_output.exists():
         names: NameListWithTime = extract_student_names(state["transcript_paths"])
         with open(path_output, "w", encoding="utf-8") as file:
-            file.write(names.model_dump_json())
+            file.write(names.model_dump_json(indent=2))
 
         state.setdefault("logs", []).append(f"Extracted names: {names.model_dump_json()}")
 
@@ -144,7 +74,7 @@ def node_validate_names(state: PipelineState) -> PipelineState:
             state["students_path"],
         )
         with open(path_output, "w", encoding="utf-8") as file:
-            file.write(validated.model_dump_json())
+            file.write(validated.model_dump_json(indent=2))
 
         state.setdefault("logs", []).append(f"Validated names: {validated.model_dump_json()}")
 
