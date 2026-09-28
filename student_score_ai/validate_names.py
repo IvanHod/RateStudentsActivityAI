@@ -1,5 +1,7 @@
 import os
-from pathlib import Path
+import re
+import unicodedata
+from collections.abc import Iterable
 from typing import Optional, Literal
 
 from pydantic import BaseModel, Field
@@ -42,23 +44,48 @@ class ValidationResult(BaseModel):
 
 def validate_student_names_with_gpt(
     found_names: NameListWithTime,
-    path_names: Path,
+    allowed_names: Iterable[str],
 ) -> ValidationResult:
     """
     Валидирует найденные ФИО по официальному списку через GPT.
 
     Args:
         found_names: список имен/фамилий, извлеченных из транскрипта
-        path_names: путь к официальному списку допустимых ФИО
+        allowed_names: официальный список допустимых ФИО
 
     Returns:
-        list[ValidatedStudent]
+        Результаты сопоставления всех найденных имён.
     """
     if not found_names.names:
-        return found_names
+        return ValidationResult(results=[])
 
-    with open(path_names, "r", encoding="utf-8") as f:
-        allowed_names = f.read().split('\n')
+    # Материализация списка позволяет использовать данные Google Sheets в тексте запроса модели.
+    allowed_names_list = [name.strip() for name in allowed_names if name.strip()]
+
+    # Точное совпадение фамилии и имени надёжнее модели и не зависит от наличия отчества.
+    official_names = _build_official_name_index(allowed_names_list)
+    deterministic_results: dict[int, ValidatedStudent] = {}
+    unmatched_names = []
+    unmatched_indexes = []
+    for index, found_name in enumerate(found_names.names):
+        matching_name = _match_surname_and_given_name(found_name.name, official_names)
+        if matching_name is None:
+            unmatched_names.append(found_name)
+            unmatched_indexes.append(index)
+            continue
+        deterministic_results[index] = ValidatedStudent(
+            raw_name=found_name.name,
+            status="valid",
+            matched_name=matching_name,
+            confidence=100,
+            comment="Точное совпадение фамилии и имени; отчество не учитывается",
+            minute=found_name.minute_start,
+        )
+
+    if not unmatched_names:
+        return ValidationResult(
+            results=[deterministic_results[index] for index in range(len(found_names.names))]
+        )
 
     prompt = f"""
 Ты валидируешь найденные из транскрипта ФИО студентов по официальному списку.
@@ -89,13 +116,74 @@ def validate_student_names_with_gpt(
 - Не придумывай новых людей вне официального списка.
 
 Найденные имена:
-{[f'{v.name} ({v.minute_start})' for v in found_names.names]}
+{[f'{v.name} ({v.minute_start})' for v in unmatched_names]}
 
 Официальный список студентов:
-{allowed_names}
+{allowed_names_list}
 """
 
     structured_llm = llm.with_structured_output(ValidationResult)
-    result = structured_llm.invoke(prompt)
+    model_result = structured_llm.invoke(prompt)
+    for index, validated_student in zip(unmatched_indexes, model_result.results, strict=True):
+        deterministic_results[index] = validated_student
 
-    return result
+    return ValidationResult(
+        results=[deterministic_results[index] for index in range(len(found_names.names))]
+    )
+
+
+def _build_official_name_index(allowed_names: Iterable[str]) -> dict[tuple[str, str], list[str]]:
+    """Создать индекс официальных ФИО по паре «фамилия, имя».
+
+    Args:
+        allowed_names: ФИО из официального списка студентов.
+
+    Returns:
+        Сопоставление нормализованной пары с оригинальными ФИО.
+    """
+    # Список значений сохраняет неоднозначные пары, которые нельзя подтверждать автоматически.
+    index: dict[tuple[str, str], list[str]] = {}
+    for allowed_name in allowed_names:
+        tokens = _name_tokens(allowed_name)
+        if len(tokens) < 2:
+            continue
+        index.setdefault((tokens[0], tokens[1]), []).append(allowed_name)
+    return index
+
+
+def _match_surname_and_given_name(
+    found_name: str,
+    official_names: dict[tuple[str, str], list[str]],
+) -> str | None:
+    """Найти однозначное официальное ФИО по фамилии и имени.
+
+    Args:
+        found_name: ФИО, извлечённое из транскрипта.
+        official_names: индекс официального списка студентов.
+
+    Returns:
+        Полное официальное ФИО или ``None`` для отсутствующего либо неоднозначного совпадения.
+    """
+    # Отчество намеренно не участвует в ключе, поскольку в речи оно обычно отсутствует.
+    tokens = _name_tokens(found_name)
+    if len(tokens) < 2:
+        return None
+    matches = official_names.get((tokens[0], tokens[1]), [])
+    return matches[0] if len(matches) == 1 else None
+
+
+def _name_tokens(name: str) -> list[str]:
+    """Нормализовать ФИО для устойчивого сравнения.
+
+    Args:
+        name: исходное ФИО.
+
+    Returns:
+        Список буквенных токенов в нижнем регистре.
+    """
+    # Нормализация убирает различия «ё/е» и комбинируемые акценты из таблицы.
+    normalized = unicodedata.normalize("NFKD", name.lower().replace("ё", "е"))
+    normalized = "".join(
+        character for character in normalized if not unicodedata.combining(character)
+    )
+    return re.findall(r"[a-zа-я]+", normalized)

@@ -3,6 +3,7 @@ from typing import Iterable
 from pathlib import Path
 from pydub import AudioSegment
 
+import torch
 import whisper
 
 
@@ -48,12 +49,18 @@ def transcribe_chunks(
         output_dir = Path(__file__).parent / "data" / "transcripts"
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    model = whisper.load_model(model_name, device='cuda')
+    # CUDA доступна не на macOS; CPU гарантирует корректную обработку на любой машине.
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    model = whisper.load_model(model_name, device=device)
 
     transcript_paths: list[str] = []
     full_text_parts: list[str] = []
 
-    for chunk_path in chunk_paths:
+    # Номер чанка даёт понятный ориентир во время долгой локальной транскрибации.
+    chunk_paths_list = list(chunk_paths)
+    chunk_count = len(chunk_paths_list)
+    for chunk_number, chunk_path in enumerate(chunk_paths_list, start=1):
+        print(f"Whisper: чанк {chunk_number}/{chunk_count} ({chunk_path.name})")
         result = model.transcribe(
             str(chunk_path),
             language=language,

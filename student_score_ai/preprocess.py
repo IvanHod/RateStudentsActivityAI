@@ -8,9 +8,20 @@ from scipy.io import wavfile
 
 
 def video_to_audio(video_path: Path, path_output: Path) -> Path:
-    path_output.parent.mkdir(parents=True, exist_ok=True)
+    """Извлечь оптимизированную дорожку для распознавания речи.
 
-    path_output_tmp = path_output.parent / f'{path_output.stem}_draft{path_output.suffix}'
+    Args:
+        video_path: путь к исходному видео.
+        path_output: путь итогового WAV-файла.
+
+    Returns:
+        Путь к созданному WAV-файлу.
+
+    Raises:
+        RuntimeError: если FFmpeg не смог обработать видео.
+    """
+    # FFmpeg обрабатывает длинные лекции потоково, не занимая память полной WAV-записью.
+    path_output.parent.mkdir(parents=True, exist_ok=True)
     cmd = [
         "ffmpeg",
         "-y",
@@ -26,19 +37,82 @@ def video_to_audio(video_path: Path, path_output: Path) -> Path:
         # "loudnorm=I=-16:TP=-1.5:LRA=7,"     # Нормализация под стандарт Whisper (-16 LUFS)
         # "lowpass=f=7500",                   # Мягкий срез выше 7.5 кГц (убирает шипение, но сохраняет речь)
         "-c:a", "pcm_s16le",
-        str(path_output_tmp.absolute())
+        str(path_output.absolute())
     ]
     result = subprocess.run(cmd, capture_output=True, text=True, encoding='utf-8', errors='replace')
 
+    # Ошибка должна прервать конвейер до Whisper, иначе будет обработан повреждённый файл.
     if result.returncode != 0:
-        print("❌ Ошибка FFmpeg:")
-        print(result.stderr)  # Здесь будет точная причина
+        raise RuntimeError(f"FFmpeg не обработал {video_path.name}: {result.stderr}")
 
-    reduce_noize(path_output_tmp, path_output)
     return path_output
 
 
-def reduce_noize(path_in: Path, path_out: Path):
+def compress_video(video_path: Path, path_output: Path) -> Path:
+    """Сжать видеопоток без изменения аудиодорожек.
+
+    Args:
+        video_path: путь к исходному видео.
+        path_output: путь к сжатому видео в контейнере MKV.
+
+    Returns:
+        Путь к сжатой видеокопии.
+
+    Raises:
+        RuntimeError: если FFmpeg не смог сжать видео.
+    """
+    # Готовая копия позволяет безопасно продолжить прерванный запуск без повторного сжатия.
+    if path_output.exists():
+        return path_output
+
+    path_output.parent.mkdir(parents=True, exist_ok=True)
+    temporary_path = path_output.with_name(f"{path_output.stem}.partial{path_output.suffix}")
+    cmd = [
+        "ffmpeg",
+        "-y",
+        "-i",
+        str(video_path.absolute()),
+        "-map",
+        "0:v",
+        "-map",
+        "0:a?",
+        "-map",
+        "0:s?",
+        "-c:v",
+        "libx264",
+        "-crf",
+        "28",
+        "-preset",
+        "medium",
+        "-c:a",
+        "copy",
+        "-c:s",
+        "copy",
+        str(temporary_path.absolute()),
+    ]
+    result = subprocess.run(
+        cmd,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+    )
+
+    # Исходник удаляется только после успешного и атомарного создания сжатой копии.
+    if result.returncode != 0:
+        raise RuntimeError(f"FFmpeg не сжал {video_path.name}: {result.stderr}")
+    temporary_path.replace(path_output)
+    return path_output
+
+
+def reduce_noize(path_in: Path, path_out: Path) -> None:
+    """Применить шумоподавление к WAV-файлу.
+
+    Args:
+        path_in: путь к исходному WAV-файлу.
+        path_out: путь для сохранения результата.
+    """
+    # Функция сохранена для возможного отдельного этапа улучшения аудио.
     rate, data = wavfile.read(path_in)
 
     data_f = data.astype(np.float32)
