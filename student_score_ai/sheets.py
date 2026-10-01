@@ -2,7 +2,7 @@
 """Чтение студентов и начисление баллов в Google Sheets."""
 
 from collections import Counter
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
 from datetime import date, datetime
 from typing import Any
 
@@ -60,6 +60,54 @@ def get_students(
     )
 
 
+def get_score_values(
+    service_account_path: str,
+    sheet_id: str,
+    worksheet_name: str,
+    students: Iterable[str],
+    lecture_date: date,
+    start_row: int = 4,
+) -> dict[str, float]:
+    """Прочитать текущие баллы указанных студентов в колонке недели лекции.
+
+    Args:
+        service_account_path: путь к JSON-ключу service account.
+        sheet_id: идентификатор Google-таблицы.
+        worksheet_name: название листа таблицы.
+        students: ФИО, значения которых нужно прочитать.
+        lecture_date: дата, определяющая колонку недели.
+        start_row: первая строка со студентом.
+
+    Returns:
+        Текущие числовые баллы только для найденных ФИО.
+    """
+    # Пустой список не должен создавать сетевой запрос при preview без корректировок.
+    requested_students = {student.strip() for student in students if student.strip()}
+    if not requested_students:
+        return {}
+
+    # Оба диапазона читаются одинаково для аудита и записи, чтобы сравнивались те же ячейки.
+    service = get_sheets_service(service_account_path)
+    names_range = f"'{worksheet_name}'!A{start_row}:A"
+    names = _get_values(service, sheet_id, names_range).get("values", [])
+    score_column = _find_lecture_column(service, sheet_id, worksheet_name, lecture_date)
+    scores_range = f"'{worksheet_name}'!{score_column}{start_row}:{score_column}"
+    scores = _get_values(service, sheet_id, scores_range).get("values", [])
+    score_values: dict[str, float] = {}
+    for index, row in enumerate(names, start=start_row):
+        name = row[0].strip() if row else ""
+        if name not in requested_students:
+            continue
+        score_index = index - start_row
+        current_value = (
+            scores[score_index][0]
+            if score_index < len(scores) and scores[score_index]
+            else "0"
+        )
+        score_values[name] = _parse_score(current_value)
+    return score_values
+
+
 def update_scores(
     service_account_path: str,
     sheet_id: str,
@@ -83,11 +131,63 @@ def update_scores(
     Returns:
         Сведения о выполненных изменениях.
     """
-    # Счётчик сохраняет все упоминания: каждое из них добавляет 0,5 балла.
+    # Счётчик сохраняет все упоминания, после чего общая функция применяет их одной пачкой.
     mentions = Counter(student.strip() for student in students if student.strip())
     if not mentions:
         return []
 
+    adjustments = {
+        student: mention_count * points_per_mention
+        for student, mention_count in mentions.items()
+    }
+    updates = apply_score_adjustments(
+        service_account_path=service_account_path,
+        sheet_id=sheet_id,
+        worksheet_name=worksheet_name,
+        adjustments=adjustments,
+        lecture_date=lecture_date,
+        start_row=start_row,
+    )
+    # Обычный конвейер хранит число упоминаний в completed.json для последующих сверок.
+    for update in updates:
+        update["mentions"] = mentions[str(update["student"])]
+    return updates
+
+
+def apply_score_adjustments(
+    service_account_path: str,
+    sheet_id: str,
+    worksheet_name: str,
+    adjustments: Mapping[str, float],
+    lecture_date: date,
+    start_row: int = 4,
+) -> list[dict[str, str | int | float]]:
+    """Применить положительные или отрицательные изменения баллов в одной колонке.
+
+    Args:
+        service_account_path: путь к JSON-ключу service account.
+        sheet_id: идентификатор Google-таблицы.
+        worksheet_name: название листа таблицы.
+        adjustments: изменение баллов по каждому полному ФИО.
+        lecture_date: дата, определяющая колонку недели.
+        start_row: первая строка со студентом.
+
+    Returns:
+        Сведения о выполненных изменениях.
+
+    Raises:
+        RuntimeError: если корректировка сделает балл студента отрицательным.
+    """
+    # Нулевые изменения исключаются до сетевых запросов, чтобы повторный dry-run не менял таблицу.
+    nonzero_adjustments = {
+        student.strip(): adjustment
+        for student, adjustment in adjustments.items()
+        if student.strip() and adjustment != 0
+    }
+    if not nonzero_adjustments:
+        return []
+
+    # Имена и нужная колонка читаются один раз, чтобы вся корректировка ушла пакетно.
     service = get_sheets_service(service_account_path)
     names_range = f"'{worksheet_name}'!A{start_row}:A"
     names = _get_values(service, sheet_id, names_range).get("values", [])
@@ -100,8 +200,8 @@ def update_scores(
     updated: list[dict[str, str | int | float]] = []
     for index, row in enumerate(names, start=start_row):
         name = row[0].strip() if row else ""
-        mention_count = mentions.get(name, 0)
-        if not mention_count:
+        points_added = nonzero_adjustments.get(name, 0)
+        if not points_added:
             continue
         score_index = index - start_row
         current_value = (
@@ -110,15 +210,18 @@ def update_scores(
             else "0"
         )
         current_score = _parse_score(current_value)
-        points_added = mention_count * points_per_mention
         new_score = current_score + points_added
+        if new_score < 0:
+            raise RuntimeError(
+                f"Корректировка для «{name}» приводит к отрицательному баллу: "
+                f"{current_score} + {points_added}"
+            )
         changes.append(
             {"range": f"'{worksheet_name}'!{score_column}{index}", "values": [[new_score]]}
         )
         updated.append(
             {
                 "student": name,
-                "mentions": mention_count,
                 "old": current_score,
                 "added": points_added,
                 "new": new_score,

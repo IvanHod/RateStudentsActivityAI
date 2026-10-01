@@ -17,4 +17,5 @@ dependencies = [
     "pydub>=0.25.1",
     "python-dotenv>=1.0.0",
     "py7zr>=1.0.0",
+    "jiwer>=4.0.0",
 ]

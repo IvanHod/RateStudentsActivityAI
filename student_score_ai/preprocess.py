@@ -49,11 +49,11 @@ def video_to_audio(video_path: Path, path_output: Path) -> Path:
 
 
 def compress_video(video_path: Path, path_output: Path) -> Path:
-    """Сжать видеопоток без изменения аудиодорожек.
+    """Сжать видео в совместимый MP4-файл.
 
     Args:
         video_path: путь к исходному видео.
-        path_output: путь к сжатому видео в контейнере MKV.
+        path_output: путь к сжатому видео в контейнере MP4.
 
     Returns:
         Путь к сжатой видеокопии.
@@ -61,7 +61,7 @@ def compress_video(video_path: Path, path_output: Path) -> Path:
     Raises:
         RuntimeError: если FFmpeg не смог сжать видео.
     """
-    # Готовая копия позволяет безопасно продолжить прерванный запуск без повторного сжатия.
+    # Готовая MP4-копия позволяет безопасно продолжить прерванный запуск без повторного сжатия.
     if path_output.exists():
         return path_output
 
@@ -76,8 +76,6 @@ def compress_video(video_path: Path, path_output: Path) -> Path:
         "0:v",
         "-map",
         "0:a?",
-        "-map",
-        "0:s?",
         "-c:v",
         "libx264",
         "-crf",
@@ -85,9 +83,11 @@ def compress_video(video_path: Path, path_output: Path) -> Path:
         "-preset",
         "medium",
         "-c:a",
-        "copy",
-        "-c:s",
-        "copy",
+        "aac",
+        "-b:a",
+        "128k",
+        "-movflags",
+        "+faststart",
         str(temporary_path.absolute()),
     ]
     result = subprocess.run(
