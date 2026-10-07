@@ -25,6 +25,10 @@ REFERENCE = (
 
 SUPPORTED_EXTENSIONS = {".wav", ".mp3", ".m4a", ".flac", ".ogg", ".opus"}
 WHISPER_SAMPLE_RATE = 16_000
+DEFAULT_VAD_THRESHOLD = 0.5
+DEFAULT_VAD_MIN_SPEECH_MS = 100
+DEFAULT_VAD_MIN_SILENCE_MS = 500
+DEFAULT_VAD_SPEECH_PAD_MS = 400
 SUBJECT_TERMS_PROMPT = (
     "алгоритмы, структуры данных, компилятор, преобразование типов, "
     "типы данных, int, переменная, var"
@@ -75,24 +79,33 @@ def normalize_text(text: str) -> str:
     return text
 
 
-def collect_audio_files(input_path: Path) -> list[Path]:
-    if input_path.is_file():
-        if input_path.suffix.lower() not in SUPPORTED_EXTENSIONS:
-            raise ValueError(f"Неподдерживаемый формат: {input_path.suffix}")
-        return [input_path]
+def collect_audio_files(input_paths: Sequence[Path]) -> list[Path]:
+    """Return unique supported audio files from the requested files and folders."""
+    # Several explicit files make it possible to reproduce a benchmark exactly.
+    files: set[Path] = set()
+    for input_path in input_paths:
+        if input_path.is_file():
+            if input_path.suffix.lower() not in SUPPORTED_EXTENSIONS:
+                raise ValueError(f"Неподдерживаемый формат: {input_path.suffix}")
+            files.add(input_path)
+            continue
 
-    if not input_path.is_dir():
-        raise FileNotFoundError(f"Не найден путь: {input_path}")
+        if not input_path.is_dir():
+            raise FileNotFoundError(f"Не найден путь: {input_path}")
 
-    files = sorted(
-        p for p in input_path.iterdir()
-        if p.is_file() and p.suffix.lower() in SUPPORTED_EXTENSIONS
-    )
+        # Directory input remains convenient when every audio file is in scope.
+        files.update(
+            path
+            for path in input_path.iterdir()
+            if path.is_file() and path.suffix.lower() in SUPPORTED_EXTENSIONS
+        )
+
     if not files:
         raise FileNotFoundError(
-            f"В {input_path} не найдено аудиофайлов: {sorted(SUPPORTED_EXTENSIONS)}"
+            "Не найдены аудиофайлы: "
+            f"{sorted(SUPPORTED_EXTENSIONS)}"
         )
-    return files
+    return sorted(files)
 
 
 def load_vad_model() -> Any:
@@ -249,18 +262,22 @@ def transcribe_file(
     return text, language, language_probability, vad_statistics
 
 
-def evaluate(reference: str, hypothesis: str) -> dict:
+def evaluate(reference: str, hypothesis: str) -> dict[str, str | float | int]:
+    """Calculate normalized word and character recognition metrics."""
+    # Identical normalization keeps punctuation from affecting ASR quality metrics.
     ref_norm = normalize_text(reference)
     hyp_norm = normalize_text(hypothesis)
 
+    # Both granularities are needed because WER alone hides character-level changes.
     word_result = jiwer.process_words(ref_norm, hyp_norm)
     char_result = jiwer.process_characters(ref_norm, hyp_norm)
 
+    # Error components reveal whether a setting loses speech or hallucinates additions.
     ref_words = len(ref_norm.split())
     word_errors = (
-            word_result.substitutions
-            + word_result.deletions
-            + word_result.insertions
+        word_result.substitutions
+        + word_result.deletions
+        + word_result.insertions
     )
 
     return {
@@ -286,7 +303,8 @@ def main() -> None:
     parser.add_argument(
         "input",
         type=Path,
-        help="Аудиофайл или папка с несколькими вариантами аудио.",
+        nargs="+",
+        help="Аудиофайлы и/или папки с несколькими вариантами аудио.",
     )
     parser.add_argument(
         "--output",
@@ -360,26 +378,38 @@ def main() -> None:
     parser.add_argument(
         "--vad-threshold",
         type=float,
-        default=0.6,
-        help="Порог уверенности Silero VAD: 0..1; выше — строже. По умолчанию 0.6.",
+        default=DEFAULT_VAD_THRESHOLD,
+        help=(
+            "Порог уверенности Silero VAD: 0..1; выше — строже. "
+            f"По умолчанию {DEFAULT_VAD_THRESHOLD}."
+        ),
     )
     parser.add_argument(
         "--vad-min-speech-ms",
         type=int,
-        default=250,
-        help="Минимальная длительность речи для VAD в мс. По умолчанию 250.",
+        default=DEFAULT_VAD_MIN_SPEECH_MS,
+        help=(
+            "Минимальная длительность речи для VAD в мс. "
+            f"По умолчанию {DEFAULT_VAD_MIN_SPEECH_MS}."
+        ),
     )
     parser.add_argument(
         "--vad-min-silence-ms",
         type=int,
-        default=500,
-        help="Пауза, разделяющая речь, для VAD в мс. По умолчанию 500.",
+        default=DEFAULT_VAD_MIN_SILENCE_MS,
+        help=(
+            "Пауза, разделяющая речь, для VAD в мс. "
+            f"По умолчанию {DEFAULT_VAD_MIN_SILENCE_MS}."
+        ),
     )
     parser.add_argument(
         "--vad-speech-pad-ms",
         type=int,
-        default=200,
-        help="Запас до и после речи для VAD в мс. По умолчанию 200.",
+        default=DEFAULT_VAD_SPEECH_PAD_MS,
+        help=(
+            "Запас до и после речи для VAD в мс. "
+            f"По умолчанию {DEFAULT_VAD_SPEECH_PAD_MS}."
+        ),
     )
     args = parser.parse_args()
 
