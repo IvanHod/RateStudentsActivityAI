@@ -9,7 +9,6 @@ ollama pull frozenlab/qwen3-asr:0.6b
 ollama run frozenlab/qwen3-asr:0.6b
 
 - GigaAM v3 — специализированная русская модель.
-- Whisper large-v3 — базовая контрольная модель.
 - Phi-4-Multimodal — отдельный тест для задачи «аудио + инструкции + суммаризация».
 - Moonshine — только если появится русская модель.
 - Distil-Whisper — не включать в русское сравнение без специального multilingual checkpoint.

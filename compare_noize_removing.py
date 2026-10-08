@@ -34,6 +34,7 @@ DEFAULT_VAD_MIN_SILENCE_MS = 500
 DEFAULT_VAD_SPEECH_PAD_MS = 200
 DEFAULT_OLLAMA_BASE_URL = "http://127.0.0.1:11434"
 DEFAULT_OLLAMA_TIMEOUT_SECONDS = 900.0
+DEFAULT_GIGAAM_MAX_SEGMENT_SECONDS = 24.0
 SUBJECT_TERMS_PROMPT = (
     "алгоритмы, структуры данных, компилятор, преобразование типов, "
     "типы данных, int, переменная, var"
@@ -200,6 +201,56 @@ class OllamaBackend:
         return response
 
 
+class GigaAMBackend:
+    """Adapt a local GigaAM short-form model to the common ASR contract."""
+
+    name = "gigaam"
+
+    def __init__(
+        self,
+        model: Any,
+        model_name: str,
+        max_segment_seconds: float,
+    ) -> None:
+        """Store a loaded GigaAM model and its safe short-form segment limit."""
+        self._model = model
+        self.model_name = model_name
+        self._max_segment_samples = int(
+            max_segment_seconds * WHISPER_SAMPLE_RATE
+        )
+
+    def transcribe(
+        self,
+        audio: np.ndarray,
+        settings: TranscriptionSettings,
+    ) -> TranscriptionResult:
+        """Transcribe VAD-ready audio in chunks accepted by GigaAM's short API."""
+        del settings
+
+        # GigaAM rejects recordings longer than 25 seconds, while VAD may join speech
+        # fragments into a longer waveform. Splitting at 24 seconds preserves a margin.
+        chunks = split_audio_for_gigaam(audio, self._max_segment_samples)
+        text = " ".join(self._transcribe_chunk(chunk) for chunk in chunks).strip()
+        return TranscriptionResult(
+            text=text,
+            language="ru",
+            language_probability=1.0,
+        )
+
+    def _transcribe_chunk(self, audio: np.ndarray) -> str:
+        """Persist one safe waveform chunk for GigaAM's path-based API."""
+        # The official API accepts a WAV path, so a temporary lossless file prevents
+        # a second decoding path from changing the VAD-filtered signal.
+        with tempfile.NamedTemporaryFile(suffix=".wav") as audio_file:
+            write_wav(audio_file.name, audio)
+            result = self._model.transcribe(audio_file.name)
+
+        text = getattr(result, "text", result)
+        if not isinstance(text, str):
+            raise RuntimeError("GigaAM вернула транскрипцию не строкового типа.")
+        return text.strip()
+
+
 def normalize_ollama_text(text: str) -> str:
     """Remove optional ASR metadata wrappers emitted by compatible Ollama models."""
     # Qwen3-ASR returns language metadata before the actual <asr_text> payload.
@@ -218,6 +269,23 @@ def write_wav(path: str, audio: np.ndarray) -> None:
         wav_file.setsampwidth(np.dtype(np.int16).itemsize)
         wav_file.setframerate(WHISPER_SAMPLE_RATE)
         wav_file.writeframes(pcm_audio.tobytes())
+
+
+def split_audio_for_gigaam(
+    audio: np.ndarray,
+    max_segment_samples: int,
+) -> tuple[np.ndarray, ...]:
+    """Split a waveform into non-empty chunks below GigaAM's short-form limit."""
+    if max_segment_samples <= 0:
+        raise ValueError("Лимит сегмента GigaAM должен быть больше нуля.")
+    if audio.size == 0:
+        raise ValueError("Нельзя отправить GigaAM пустой аудиофрагмент.")
+
+    # Exact sample boundaries avoid resampling and guarantee every part remains safe.
+    return tuple(
+        audio[start : start + max_segment_samples]
+        for start in range(0, len(audio), max_segment_samples)
+    )
 
 
 def normalize_text(text: str) -> str:
@@ -476,6 +544,7 @@ def create_backend(
     device_index: int,
     ollama_base_url: str,
     ollama_timeout_seconds: float,
+    gigaam_max_segment_seconds: float,
 ) -> TranscriptionBackend:
     """Create the requested ASR adapter without changing benchmark orchestration."""
     # Provider-specific initialization remains isolated from VAD and metric calculation.
@@ -488,6 +557,21 @@ def create_backend(
             base_url=ollama_base_url,
             model_name=model_name,
             timeout_seconds=ollama_timeout_seconds,
+        )
+    if backend_name == GigaAMBackend.name:
+        try:
+            import gigaam
+        except ImportError as exc:
+            raise RuntimeError(
+                "Не установлен GigaAM. Выполните `uv sync` в корне проекта."
+            ) from exc
+
+        # CPU is explicit here because the benchmark environment has no CUDA device.
+        model = gigaam.load_model(model_name, fp16_encoder=False, device="cpu")
+        return GigaAMBackend(
+            model=model,
+            model_name=model_name,
+            max_segment_seconds=gigaam_max_segment_seconds,
         )
     raise ValueError(f"Неподдерживаемый ASR-бэкенд: {backend_name}")
 
@@ -518,7 +602,7 @@ def main() -> None:
     parser.add_argument(
         "--backend",
         default=WhisperBackend.name,
-        choices=(WhisperBackend.name, OllamaBackend.name),
+        choices=(WhisperBackend.name, OllamaBackend.name, GigaAMBackend.name),
         help="ASR-бэкенд. По умолчанию whisper.",
     )
     parser.add_argument(
@@ -553,6 +637,15 @@ def main() -> None:
         help=(
             "Таймаут одного Ollama-запроса в секундах. "
             f"По умолчанию {DEFAULT_OLLAMA_TIMEOUT_SECONDS:.0f}."
+        ),
+    )
+    parser.add_argument(
+        "--gigaam-max-segment-seconds",
+        type=float,
+        default=DEFAULT_GIGAAM_MAX_SEGMENT_SECONDS,
+        help=(
+            "Максимальная длительность WAV-части для GigaAM (< 25 с). "
+            f"По умолчанию {DEFAULT_GIGAAM_MAX_SEGMENT_SECONDS:.0f}."
         ),
     )
     parser.add_argument(
@@ -647,6 +740,8 @@ def main() -> None:
         parser.error("Параметры длительности VAD должны быть >= 0")
     if args.ollama_timeout_seconds <= 0:
         parser.error("--ollama-timeout-seconds должен быть больше 0")
+    if not 0 < args.gigaam_max_segment_seconds < 25:
+        parser.error("--gigaam-max-segment-seconds должен быть больше 0 и меньше 25")
 
     # Keep prompting opt-in because the evaluated recordings showed prompt repetition.
     initial_prompt = (
@@ -679,6 +774,11 @@ def main() -> None:
     print(f"VAD: {'включён' if vad_settings.enabled else 'отключён'}")
     if args.backend == OllamaBackend.name:
         print(f"Ollama API: {args.ollama_base_url}")
+    if args.backend == GigaAMBackend.name:
+        print(
+            "Лимит части GigaAM: "
+            f"{args.gigaam_max_segment_seconds:.2f} с"
+        )
 
     # Initialize shared services once so every variant sees identical dependencies.
     vad_model = load_vad_model() if vad_settings.enabled else None
@@ -690,6 +790,7 @@ def main() -> None:
         device_index=args.device_index,
         ollama_base_url=args.ollama_base_url,
         ollama_timeout_seconds=args.ollama_timeout_seconds,
+        gigaam_max_segment_seconds=args.gigaam_max_segment_seconds,
     )
 
     rows = []
@@ -755,7 +856,7 @@ def main() -> None:
                             else "VAD: отключён"
                         ),
                         "",
-                        "WHISPER:",
+                        "TRANSCRIPTION:",
                         text,
                         "",
                         "NORMALIZED:",
@@ -855,6 +956,11 @@ def main() -> None:
         if args.backend == OllamaBackend.name:
             f.write(f"ollama_base_url: {args.ollama_base_url}\n")
             f.write(f"ollama_timeout_seconds: {args.ollama_timeout_seconds}\n\n")
+        if args.backend == GigaAMBackend.name:
+            f.write(
+                "gigaam_max_segment_seconds: "
+                f"{args.gigaam_max_segment_seconds}\n\n"
+            )
         f.write("REFERENCE:\n")
         f.write(reference)
         f.write("\n\nNORMALIZED REFERENCE:\n")
