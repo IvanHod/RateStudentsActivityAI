@@ -28,7 +28,7 @@ WHISPER_SAMPLE_RATE = 16_000
 DEFAULT_VAD_THRESHOLD = 0.5
 DEFAULT_VAD_MIN_SPEECH_MS = 100
 DEFAULT_VAD_MIN_SILENCE_MS = 500
-DEFAULT_VAD_SPEECH_PAD_MS = 400
+DEFAULT_VAD_SPEECH_PAD_MS = 200
 SUBJECT_TERMS_PROMPT = (
     "алгоритмы, структуры данных, компилятор, преобразование типов, "
     "типы данных, int, переменная, var"
