@@ -5,11 +5,14 @@ import argparse
 import csv
 import re
 import sys
+import tempfile
 import unicodedata
+import wave
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Sequence
+from typing import Any, Protocol, Sequence
 
+import httpx
 import jiwer
 import numpy as np
 import whisper
@@ -29,6 +32,8 @@ DEFAULT_VAD_THRESHOLD = 0.5
 DEFAULT_VAD_MIN_SPEECH_MS = 100
 DEFAULT_VAD_MIN_SILENCE_MS = 500
 DEFAULT_VAD_SPEECH_PAD_MS = 200
+DEFAULT_OLLAMA_BASE_URL = "http://127.0.0.1:11434"
+DEFAULT_OLLAMA_TIMEOUT_SECONDS = 900.0
 SUBJECT_TERMS_PROMPT = (
     "алгоритмы, структуры данных, компилятор, преобразование типов, "
     "типы данных, int, переменная, var"
@@ -52,6 +57,167 @@ class VadStatistics:
 
     segments: int
     speech_seconds: float
+
+
+@dataclass(frozen=True)
+class TranscriptionSettings:
+    """Store decoding inputs shared by every ASR backend."""
+
+    language: str
+    initial_prompt: str | None
+    beam_size: int
+
+
+@dataclass(frozen=True)
+class TranscriptionResult:
+    """Describe the normalized response returned by an ASR backend."""
+
+    text: str
+    language: str
+    language_probability: float
+
+
+class TranscriptionBackend(Protocol):
+    """Define the adapter contract required to evaluate an ASR provider."""
+
+    name: str
+    model_name: str
+
+    def transcribe(
+        self,
+        audio: np.ndarray,
+        settings: TranscriptionSettings,
+    ) -> TranscriptionResult:
+        """Transcribe a mono 16 kHz waveform with provider-specific transport."""
+
+
+class WhisperBackend:
+    """Adapt local OpenAI Whisper to the common ASR backend contract."""
+
+    name = "whisper"
+
+    def __init__(self, model: whisper.Whisper, model_name: str) -> None:
+        """Store the loaded Whisper model and its user-facing identifier."""
+        self._model = model
+        self.model_name = model_name
+
+    def transcribe(
+        self,
+        audio: np.ndarray,
+        settings: TranscriptionSettings,
+    ) -> TranscriptionResult:
+        """Run local Whisper with deterministic settings used by prior experiments."""
+        # Stable decoding makes backend and audio comparisons repeatable.
+        options: dict[str, Any] = {
+            "language": settings.language,
+            "task": "transcribe",
+            "initial_prompt": settings.initial_prompt,
+            "beam_size": settings.beam_size,
+            "temperature": 0.0,
+            "condition_on_previous_text": False,
+            "verbose": False,
+        }
+        result = self._model.transcribe(audio, **options)
+        return TranscriptionResult(
+            text=result["text"].strip(),
+            language=result.get("language", settings.language),
+            language_probability=1.0,
+        )
+
+
+class OllamaBackend:
+    """Adapt Ollama's OpenAI-compatible audio transcription endpoint."""
+
+    name = "ollama"
+
+    def __init__(self, base_url: str, model_name: str, timeout_seconds: float) -> None:
+        """Store the remote endpoint and ASR model selected for the experiment."""
+        self._base_url = base_url.rstrip("/")
+        self.model_name = model_name
+        self._timeout_seconds = timeout_seconds
+
+    def transcribe(
+        self,
+        audio: np.ndarray,
+        settings: TranscriptionSettings,
+    ) -> TranscriptionResult:
+        """Upload a temporary WAV to Ollama and normalize its JSON response."""
+        # A WAV file gives HTTP ASR backends the exact VAD-filtered samples Whisper sees.
+        with tempfile.NamedTemporaryFile(suffix=".wav") as audio_file:
+            write_wav(audio_file.name, audio)
+            response = self._send_transcription_request(audio_file.name, settings)
+
+        # API validation turns malformed provider responses into actionable benchmark errors.
+        try:
+            payload = response.json()
+            text = payload["text"]
+        except (KeyError, TypeError, ValueError) as exc:
+            raise RuntimeError(
+                "Ollama вернула ответ без строкового поля 'text': "
+                f"{response.text[:500]}"
+            ) from exc
+
+        if not isinstance(text, str):
+            raise RuntimeError("Ollama вернула поле 'text' не строкового типа.")
+
+        return TranscriptionResult(
+            text=normalize_ollama_text(text),
+            language=settings.language,
+            language_probability=1.0,
+        )
+
+    def _send_transcription_request(
+        self,
+        audio_path: str,
+        settings: TranscriptionSettings,
+    ) -> httpx.Response:
+        """Send one multipart transcription request to the configured Ollama server."""
+        # Multipart is required by the OpenAI-compatible /v1/audio/transcriptions API.
+        form_data: dict[str, str] = {
+            "model": self.model_name,
+            "language": settings.language,
+            "response_format": "json",
+        }
+        if settings.initial_prompt:
+            form_data["prompt"] = settings.initial_prompt
+
+        try:
+            with open(audio_path, "rb") as audio_file:
+                response = httpx.post(
+                    f"{self._base_url}/v1/audio/transcriptions",
+                    data=form_data,
+                    files={"file": ("audio.wav", audio_file, "audio/wav")},
+                    timeout=self._timeout_seconds,
+                )
+            response.raise_for_status()
+        except httpx.HTTPError as exc:
+            raise RuntimeError(
+                "Не удалось выполнить Ollama ASR-запрос. "
+                f"Проверьте --ollama-base-url ({self._base_url}), модель "
+                f"'{self.model_name}' и доступность /v1/audio/transcriptions."
+            ) from exc
+
+        return response
+
+
+def normalize_ollama_text(text: str) -> str:
+    """Remove optional ASR metadata wrappers emitted by compatible Ollama models."""
+    # Qwen3-ASR returns language metadata before the actual <asr_text> payload.
+    if "<asr_text>" in text:
+        text = text.split("<asr_text>", maxsplit=1)[1]
+    return text.replace("</asr_text>", "").strip()
+
+
+def write_wav(path: str, audio: np.ndarray) -> None:
+    """Write a mono float waveform as a PCM WAV file for HTTP ASR backends."""
+    # Clipping prevents integer overflow while preserving Whisper's normalized amplitude.
+    pcm_audio = np.clip(audio, -1.0, 1.0)
+    pcm_audio = (pcm_audio * np.iinfo(np.int16).max).astype("<i2")
+    with wave.open(path, "wb") as wav_file:
+        wav_file.setnchannels(1)
+        wav_file.setsampwidth(np.dtype(np.int16).itemsize)
+        wav_file.setframerate(WHISPER_SAMPLE_RATE)
+        wav_file.writeframes(pcm_audio.tobytes())
 
 
 def normalize_text(text: str) -> str:
@@ -144,14 +310,12 @@ def merge_speech_intervals(
 
 
 def extract_speech_audio(
-    audio_path: Path,
+    audio: np.ndarray,
     *,
-    start: float,
-    end: float | None,
     vad_model: Any,
     vad_settings: VadSettings,
 ) -> tuple[np.ndarray, VadStatistics]:
-    """Return only VAD-detected speech from the requested interval of an audio file."""
+    """Return only VAD-detected speech from an already selected audio interval."""
     try:
         import torch
         from silero_vad import get_speech_timestamps
@@ -160,22 +324,9 @@ def extract_speech_audio(
             "Для VAD требуются torch и silero-vad. Выполните `uv sync`."
         ) from exc
 
-    # Decode with Whisper so VAD and ASR receive the same mono 16 kHz waveform.
-    audio = whisper.load_audio(str(audio_path))
-    start_sample = int(start * WHISPER_SAMPLE_RATE)
-    end_sample = (
-        len(audio)
-        if end is None
-        else min(int(end * WHISPER_SAMPLE_RATE), len(audio))
-    )
-    selected_audio = audio[start_sample:end_sample]
-
-    if selected_audio.size == 0:
-        raise ValueError("В выбранном интервале нет аудиосэмплов.")
-
     # Detect speech before ASR so silent or noisy regions cannot trigger decoding loops.
     timestamps = get_speech_timestamps(
-        torch.from_numpy(selected_audio),
+        torch.from_numpy(audio),
         vad_model,
         threshold=vad_settings.threshold,
         sampling_rate=WHISPER_SAMPLE_RATE,
@@ -192,7 +343,7 @@ def extract_speech_audio(
     # Concatenation prevents Whisper from decoding long silences while retaining word edges.
     speech_audio = np.concatenate(
         [
-            selected_audio[segment_start:segment_end]
+            audio[segment_start:segment_end]
             for segment_start, segment_end in intervals
         ]
     )
@@ -204,62 +355,72 @@ def extract_speech_audio(
     )
 
 
-def transcribe_file(
-    model: whisper.Whisper,
+def load_audio_interval(
     audio_path: Path,
     *,
     start: float,
     end: float | None,
-    beam_size: int,
-    initial_prompt: str | None,
+) -> np.ndarray:
+    """Load one mono 16 kHz interval so every backend receives the same signal."""
+    # Explicit slicing makes APIs without Whisper's clip_timestamps feature comparable.
+    audio = whisper.load_audio(str(audio_path))
+    start_sample = int(start * WHISPER_SAMPLE_RATE)
+    end_sample = (
+        len(audio)
+        if end is None
+        else min(int(end * WHISPER_SAMPLE_RATE), len(audio))
+    )
+    selected_audio = audio[start_sample:end_sample]
+    if selected_audio.size == 0:
+        raise ValueError("В выбранном интервале нет аудиосэмплов.")
+    return selected_audio
+
+
+def prepare_audio(
+    audio_path: Path,
+    *,
+    start: float,
+    end: float | None,
+    vad_model: Any | None,
+    vad_settings: VadSettings,
+) -> tuple[np.ndarray, VadStatistics | None]:
+    """Return one selected waveform and optional VAD statistics for any backend."""
+    # Shared preparation prevents different providers from receiving different intervals.
+    selected_audio = load_audio_interval(audio_path, start=start, end=end)
+    if not vad_settings.enabled:
+        return selected_audio, None
+
+    if vad_model is None:
+        raise ValueError("Модель VAD не загружена.")
+
+    return extract_speech_audio(
+        selected_audio,
+        vad_model=vad_model,
+        vad_settings=vad_settings,
+    )
+
+
+def transcribe_file(
+    backend: TranscriptionBackend,
+    audio_path: Path,
+    *,
+    start: float,
+    end: float | None,
+    transcription_settings: TranscriptionSettings,
     vad_model: Any | None,
     vad_settings: VadSettings,
 ) -> tuple[str, str, float, VadStatistics | None]:
-    """Transcribe one selected audio interval with stable Whisper settings."""
-
-    # VAD receives the selected waveform and removes non-speech before Whisper decodes it.
-    vad_statistics: VadStatistics | None = None
-    if vad_settings.enabled:
-        if vad_model is None:
-            raise ValueError("Модель VAD не загружена.")
-
-        audio_input, vad_statistics = extract_speech_audio(
-            audio_path,
-            start=start,
-            end=end,
-            vad_model=vad_model,
-            vad_settings=vad_settings,
-        )
-    else:
-        # Preserve the old timestamp-based path to make VAD-on and VAD-off comparable.
-        audio_input = str(audio_path)
-        if end is None:
-            clip_timestamps = f"{start}"
-        else:
-            clip_timestamps = f"{start},{end}"
-
-    # Keep decoder settings identical across both modes so VAD is the only changed factor.
-    transcription_options: dict[str, Any] = {
-        "language": "ru",
-        "task": "transcribe",
-        "initial_prompt": initial_prompt,
-        "beam_size": beam_size,
-        "temperature": 0.0,
-        "condition_on_previous_text": False,
-        "verbose": False,
-    }
-    if not vad_settings.enabled:
-        transcription_options["clip_timestamps"] = clip_timestamps
-
-    result = model.transcribe(audio_input, **transcription_options)
-
-    text = result["text"].strip()
-    language = result.get("language", "ru")
-
-    # Обычный whisper не возвращает language_probability
-    language_probability = 1.0
-
-    return text, language, language_probability, vad_statistics
+    """Transcribe one audio interval through the selected ASR backend."""
+    # Audio is prepared once so VAD remains an independent variable across providers.
+    audio, vad_statistics = prepare_audio(
+        audio_path,
+        start=start,
+        end=end,
+        vad_model=vad_model,
+        vad_settings=vad_settings,
+    )
+    result = backend.transcribe(audio, transcription_settings)
+    return result.text, result.language, result.language_probability, vad_statistics
 
 
 def evaluate(reference: str, hypothesis: str) -> dict[str, str | float | int]:
@@ -295,10 +456,46 @@ def evaluate(reference: str, hypothesis: str) -> dict[str, str | float | int]:
     }
 
 
+def resolve_whisper_device(device: str, device_index: int) -> str:
+    """Resolve a requested local Whisper device to its execution identifier."""
+    # CUDA auto-detection is relevant only when this process loads local Whisper weights.
+    if device == "auto":
+        import torch
+
+        return "cuda" if torch.cuda.is_available() else "cpu"
+    if device == "cuda":
+        return f"cuda:{device_index}"
+    return device
+
+
+def create_backend(
+    *,
+    backend_name: str,
+    model_name: str,
+    device: str,
+    device_index: int,
+    ollama_base_url: str,
+    ollama_timeout_seconds: float,
+) -> TranscriptionBackend:
+    """Create the requested ASR adapter without changing benchmark orchestration."""
+    # Provider-specific initialization remains isolated from VAD and metric calculation.
+    if backend_name == WhisperBackend.name:
+        whisper_device = resolve_whisper_device(device, device_index)
+        model = whisper.load_model(model_name, device=whisper_device)
+        return WhisperBackend(model, model_name)
+    if backend_name == OllamaBackend.name:
+        return OllamaBackend(
+            base_url=ollama_base_url,
+            model_name=model_name,
+            timeout_seconds=ollama_timeout_seconds,
+        )
+    raise ValueError(f"Неподдерживаемый ASR-бэкенд: {backend_name}")
+
+
 def main() -> None:
-    """Compare Whisper transcriptions of audio variants against one reference text."""
+    """Compare audio variants through a selected ASR backend against one reference."""
     parser = argparse.ArgumentParser(
-        description="Сравнение качества аудиоверсий через OpenAI Whisper + WER/CER."
+        description="Сравнение качества аудиоверсий через ASR-бэкенды + WER/CER."
     )
     parser.add_argument(
         "input",
@@ -319,9 +516,15 @@ def main() -> None:
         help="Подробный TXT с выравниванием ошибок.",
     )
     parser.add_argument(
+        "--backend",
+        default=WhisperBackend.name,
+        choices=(WhisperBackend.name, OllamaBackend.name),
+        help="ASR-бэкенд. По умолчанию whisper.",
+    )
+    parser.add_argument(
         "--model",
         default="medium",
-        help="Модель OpenAI Whisper, по умолчанию medium.",
+        help="Имя модели выбранного бэкенда. По умолчанию medium.",
     )
     parser.add_argument(
         "--device",
@@ -334,6 +537,23 @@ def main() -> None:
         type=int,
         default=0,
         help="Номер CUDA GPU, если --device cuda.",
+    )
+    parser.add_argument(
+        "--ollama-base-url",
+        default=DEFAULT_OLLAMA_BASE_URL,
+        help=(
+            "Базовый URL Ollama API. "
+            f"По умолчанию {DEFAULT_OLLAMA_BASE_URL}."
+        ),
+    )
+    parser.add_argument(
+        "--ollama-timeout-seconds",
+        type=float,
+        default=DEFAULT_OLLAMA_TIMEOUT_SECONDS,
+        help=(
+            "Таймаут одного Ollama-запроса в секундах. "
+            f"По умолчанию {DEFAULT_OLLAMA_TIMEOUT_SECONDS:.0f}."
+        ),
     )
     parser.add_argument(
         "--beam-size",
@@ -425,6 +645,8 @@ def main() -> None:
         args.vad_speech_pad_ms,
     ) < 0:
         parser.error("Параметры длительности VAD должны быть >= 0")
+    if args.ollama_timeout_seconds <= 0:
+        parser.error("--ollama-timeout-seconds должен быть больше 0")
 
     # Keep prompting opt-in because the evaluated recordings showed prompt repetition.
     initial_prompt = (
@@ -438,31 +660,37 @@ def main() -> None:
         speech_pad_ms=args.vad_speech_pad_ms,
     )
 
+    transcription_settings = TranscriptionSettings(
+        language="ru",
+        initial_prompt=initial_prompt,
+        beam_size=args.beam_size,
+    )
     reference = REFERENCE
     if args.reference_file is not None:
         reference = args.reference_file.read_text(encoding="utf-8").strip()
 
     files = collect_audio_files(args.input)
 
+    print(f"Бэкенд: {args.backend}")
     print(f"Модель: {args.model}")
     print(f"Файлов: {len(files)}")
     print(f"Фрагмент: {args.start:.2f} с -> {'конец' if args.end is None else f'{args.end:.2f} с'}")
     print(f"Initial prompt: {initial_prompt or 'отключён'}")
     print(f"VAD: {'включён' if vad_settings.enabled else 'отключён'}")
-    print("Загружаю Whisper...")
+    if args.backend == OllamaBackend.name:
+        print(f"Ollama API: {args.ollama_base_url}")
 
-    device = args.device
-
-    if device == "auto":
-        import torch
-        device = "cuda" if torch.cuda.is_available() else "cpu"
-
-    if device == "cuda":
-        device = f"cuda:{args.device_index}"
-
-    # Initialize VAD once to keep every audio variant evaluated by the same detector.
+    # Initialize shared services once so every variant sees identical dependencies.
     vad_model = load_vad_model() if vad_settings.enabled else None
-    model = whisper.load_model(args.model, device=device)
+    print(f"Инициализирую {args.backend}...")
+    backend = create_backend(
+        backend_name=args.backend,
+        model_name=args.model,
+        device=args.device,
+        device_index=args.device_index,
+        ollama_base_url=args.ollama_base_url,
+        ollama_timeout_seconds=args.ollama_timeout_seconds,
+    )
 
     rows = []
     details = []
@@ -472,18 +700,19 @@ def main() -> None:
 
         try:
             text, detected_language, language_probability, vad_statistics = transcribe_file(
-                model,
+                backend,
                 audio_path,
                 start=args.start,
                 end=args.end,
-                beam_size=args.beam_size,
-                initial_prompt=initial_prompt,
+                transcription_settings=transcription_settings,
                 vad_model=vad_model,
                 vad_settings=vad_settings,
             )
             metrics = evaluate(reference, text)
 
             row = {
+                "backend": backend.name,
+                "model": backend.model_name,
                 "file": audio_path.name,
                 "wer": metrics["wer"],
                 "cer": metrics["cer"],
@@ -540,6 +769,8 @@ def main() -> None:
 
         except Exception as exc:
             row = {
+                "backend": args.backend,
+                "model": args.model,
                 "file": audio_path.name,
                 "wer": float("inf"),
                 "cer": float("inf"),
@@ -580,6 +811,8 @@ def main() -> None:
 
     fieldnames = [
         "rank",
+        "backend",
+        "model",
         "file",
         "wer",
         "cer",
@@ -607,6 +840,7 @@ def main() -> None:
     with args.details.open("w", encoding="utf-8") as f:
         # Record inference settings so each comparison can be reproduced later.
         f.write("CONFIGURATION:\n")
+        f.write(f"backend: {backend.name}\n")
         f.write(f"model: {args.model}\n")
         f.write("language: ru\n")
         f.write(f"beam_size: {args.beam_size}\n")
@@ -618,6 +852,9 @@ def main() -> None:
         f.write(f"vad_min_speech_ms: {vad_settings.min_speech_duration_ms}\n")
         f.write(f"vad_min_silence_ms: {vad_settings.min_silence_duration_ms}\n")
         f.write(f"vad_speech_pad_ms: {vad_settings.speech_pad_ms}\n\n")
+        if args.backend == OllamaBackend.name:
+            f.write(f"ollama_base_url: {args.ollama_base_url}\n")
+            f.write(f"ollama_timeout_seconds: {args.ollama_timeout_seconds}\n\n")
         f.write("REFERENCE:\n")
         f.write(reference)
         f.write("\n\nNORMALIZED REFERENCE:\n")
